@@ -13,7 +13,7 @@ import matplotlib
 from matplotlib import pyplot as plt
 from skimage import exposure
 from skimage.restoration import denoise_bilateral, denoise_tv_chambolle, estimate_sigma
-from skimage.morphology import closing, opening, erosion, dilation, disk, diamond, square
+from skimage.morphology import closing, opening, erosion, dilation, disk, diamond, rectangle
 
 matplotlib.use('TkAgg')
 
@@ -68,6 +68,7 @@ def find_backscatter_values(B_pts, depths, restarts=10, max_mean_loss_fraction=0
                 ydata=B_vals,
                 p0=np.random.random(4) * bounds_upper,
                 bounds=(bounds_lower, bounds_upper),
+                maxfev=10000
             )
             l = loss(*optp)
             if l < best_loss:
@@ -306,15 +307,15 @@ def refine_neighborhood_map(nmap, min_size = 10, radius = 3):
         if size < min_size and label != 0:
             for x, y in zip(*np.where(nmap == label)):
                 refined_nmap[x, y] = find_closest_label(refined_nmap, x, y)
-    refined_nmap = closing(refined_nmap, square(radius))
+    refined_nmap = closing(refined_nmap, rectangle(radius, radius))
     return refined_nmap, num_labels - 1
 
 
 def load_image_and_depth_map(img_fname, depths_fname, size_limit = 1024):
     depths = Image.open(depths_fname)
     img = Image.fromarray(rawpy.imread(img_fname).postprocess())
-    img.thumbnail((size_limit, size_limit), Image.ANTIALIAS)
-    depths = depths.resize(img.size, Image.ANTIALIAS)
+    img.thumbnail((size_limit, size_limit), Image.Resampling.LANCZOS)
+    depths = depths.resize(img.size, Image.Resampling.LANCZOS)
     return np.float32(img) / 255.0, np.array(depths)
 
 '''
@@ -532,7 +533,7 @@ def run_pipeline(img, depths, args):
 
 def preprocess_for_monodepth(img_fname, output_fname, size_limit=1024):
     img = Image.fromarray(rawpy.imread(img_fname).postprocess())
-    img.thumbnail((size_limit, size_limit), Image.ANTIALIAS)
+    img.thumbnail((size_limit, size_limit), Image.Resampling.LANCZOS)
     img_adapteq = exposure.equalize_adapthist(np.array(img), clip_limit=0.03)
     Image.fromarray((np.round(img_adapteq * 255.0)).astype(np.uint8)).save(output_fname)
 
