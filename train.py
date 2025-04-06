@@ -29,11 +29,10 @@ def main(args):
     os.makedirs(args.output, exist_ok=True)
     dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     
-    # Initialize models, loss functions, and optimizers
     bs_model = BackscatterNet().to(device)
     da_model = DeattenuateNet().to(device)
-    bs_criterion = nn.L1Loss().to(device)  # example loss
-    da_criterion = nn.MSELoss().to(device)   # example loss
+    bs_criterion = nn.L1Loss().to(device) 
+    da_criterion = nn.MSELoss().to(device)
     bs_optimizer = torch.optim.Adam(bs_model.parameters(), lr=args.init_lr)
     da_optimizer = torch.optim.Adam(da_model.parameters(), lr=args.init_lr)
     
@@ -45,15 +44,11 @@ def main(args):
     total_da_time = 0.0
     total_da_evals = 0
 
-    # Training loop
     for j, (left, depth, fnames) in enumerate(dataloader):
         print(f"Training batch {j}")
         image_batch = left  # shape: (B, C, H, W)
         batch_size = image_batch.shape[0]
         
-        # -----------------------------
-        # Train BackscatterNet with AMP
-        # -----------------------------
         for _ in trange(args.init_iters if j == 0 else args.iters, desc="Backscatter Iterations"):
             start = time()
             with torch.cuda.amp.autocast():
@@ -66,7 +61,6 @@ def main(args):
             total_bs_time += (time() - start)
             total_bs_evals += batch_size
         
-        # Normalize and prepare for deattenuation branch
         direct_mean = direct.mean(dim=[2, 3], keepdim=True)
         direct_std = direct.std(dim=[2, 3], keepdim=True)
         direct_z = (direct - direct_mean) / direct_std
@@ -75,9 +69,6 @@ def main(args):
         direct_no_grad = torch.clamp((clamped_z * direct_std) +
                                      torch.maximum(direct_mean, threshold), 0, 1).detach()
 
-        # -----------------------------
-        # Train DeattenuateNet with AMP
-        # -----------------------------
         for _ in trange(args.init_iters if j == 0 else args.iters, desc="Deattenuate Iterations"):
             start = time()
             with torch.cuda.amp.autocast():
@@ -92,8 +83,8 @@ def main(args):
         # Offload loss metrics to CPU for logging
         bs_loss_cpu = bs_loss.detach().cpu().item()
         da_loss_cpu = da_loss.detach().cpu().item()
-        avg_bs_time = total_bs_time / total_bs_evals * 1000  # ms per sample
-        avg_da_time = total_da_time / total_da_evals * 1000  # ms per sample
+        avg_bs_time = total_bs_time / total_bs_evals * 1000  
+        avg_da_time = total_da_time / total_da_evals * 1000  
         avg_time = avg_bs_time + avg_da_time
         
         print(f"Losses: Backscatter: {bs_loss_cpu:.9f}, Deattenuation: {da_loss_cpu:.9f}")
@@ -106,7 +97,6 @@ def main(args):
         f_img = f_img / f_img.max()  # Normalize for saving
         J_img = torch.clamp(J, 0, 1).cpu()
         
-        # Save outputs for each sample in the batch
         for side in range(1):  # assuming single side here
             names = fnames[side]
             for n in range(batch_size):
@@ -116,12 +106,9 @@ def main(args):
                     save_image(backscatter_img[n], os.path.join(args.output, f"{name}-backscatter.png"))
                     save_image(f_img[n], os.path.join(args.output, f"{name}-f.png"))
                 save_image(J_img[n], os.path.join(args.output, f"{name}-corrected.png"))
-    
-    # -----------------------------
-    # Save the final models (offload to CPU first)
-    # -----------------------------
+
     if args.save is not None:
-        bs_model_cpu = bs_model.cpu().state_dict()
+        bs_model_cpu = bs_model.cpu().state_dict() #offload saving to CPUs
         da_model_cpu = da_model.cpu().state_dict()
         save_path = os.path.join(args.output, f"{args.save}.pth")
         torch.save({

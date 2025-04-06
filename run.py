@@ -34,7 +34,6 @@ def run(args):
             direct_no_grad = torch.clamp((clamped_z * direct_std) + torch.maximum(direct_mean, threshold), 0, 1).detach()
             f, J = da_model(direct_no_grad, depth)
             
-            # Prepare outputs for saving
             direct_img = torch.clamp(direct_no_grad, 0, 1).cpu()
             backscatter_img = torch.clamp(backscatter, 0, 1).cpu()
             f_img = f.cpu()
