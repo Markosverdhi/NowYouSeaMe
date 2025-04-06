@@ -1,8 +1,3 @@
-# Copyright 2023 Stewart Jamieson, Woods Hole Oceanographic Institution
-# This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License, version 3, as published by the Free Software Foundation.
-# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
-# You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>. 
-
 import os
 import argparse
 
@@ -12,6 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
+from torchvision.models import models
 import kornia.morphology as morph
 from PIL import Image
 try:
@@ -218,6 +214,18 @@ def main(args):
                     save_image(backscatter_img[i], "%s/%s-backscatter.png" % (save_dir, names[n].rstrip('.png')))
                     save_image(f_img[i], "%s/%s-f.png" % (save_dir, names[n].rstrip('.png')))
                 save_image(J_img[i], "%s/%s-corrected.png" % (save_dir, names[n].rstrip('.png')))
+    
+    # Save the models if the --save argument is provided.
+    if args.save is not None:
+        save_path = os.path.join(save_dir, f"{args.save}.pth")
+        torch.save({
+            'backscatter_model_state': bs_model.state_dict(),
+            'deattenuate_model_state': da_model.state_dict(),
+            'backscatter_optimizer_state': bs_optimizer.state_dict(),
+            'deattenuate_optimizer_state': da_optimizer.state_dict(),
+            'args': vars(args)
+        }, save_path)
+        print(f"Models saved to {save_path}")
 
 
 if __name__ == '__main__':
@@ -239,6 +247,8 @@ if __name__ == '__main__':
     parser.add_argument('--iters', type=int, default=50, help='How many iterations to refine each image batch')
     parser.add_argument('--init_lr', type=float, default=1e-2, help='Initial learning rate for Adam optimizer')
     parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--save', type=str, default=None,
+                        help='If provided, save the models after training with the given name (e.g. -save=1.0)')
 
     args = parser.parse_args()
     main(args)
