@@ -1,3 +1,22 @@
+import logging 
+from datetime import datetime
+# Logging config stuff
+log_filename = f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(message)s")
+console.setFormatter(formatter)
+logging.getLogger().addHandler(console)
+
+logging.info("Training started")
+
+
 import os
 import argparse
 import torch
@@ -5,12 +24,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from time import time
-from models import paired_rgb_depth_dataset, BackscatterNet, DeattenuateNet
-
-try:
-    from tqdm import trange
-except ImportError:
-    trange = range
+from NowYouSeaMe import paired_rgb_depth_dataset, BackscatterNet, DeattenuateNet
+from tqdm import trange
 
 def main(args):
     # Set seed and device
@@ -49,25 +64,37 @@ def main(args):
         image_batch = left  # shape: (B, C, H, W)
         batch_size = image_batch.shape[0]
         
-        for _ in trange(args.init_iters if j == 0 else args.iters, desc="Backscatter Iterations"):
-            start = time()
-            with torch.cuda.amp.autocast():
-                direct, backscatter = bs_model(image_batch, depth)
-                # Using L1 loss on the rectified direct image as an example
-                bs_loss = bs_criterion(torch.relu(direct), torch.zeros_like(direct))
-            scaler.scale(bs_loss).backward()
-            scaler.step(bs_optimizer)
-            scaler.update()
-            total_bs_time += (time() - start)
-            total_bs_evals += batch_size
+        if j==0:
+            for _ in trange(args.init_iters, desc="Backscatter Iterations"):
+                start = time()
+                with torch.cuda.amp.autocast():
+                    direct = bs_model(depth)
+                    # Using L1 loss on the rectified direct image as an example
+                    bs_loss = bs_criterion(torch.relu(direct), torch.zeros_like(direct))
+                scaler.scale(bs_loss).backward()
+                scaler.step(bs_optimizer)
+                scaler.update()
+                total_bs_time += (time() - start)
+                total_bs_evals += batch_size
+        else:
+            for _ in trange(args.iters, desc="Backscatter Iterations"):
+                start = time()
+                with torch.cuda.amp.autocast():
+                    direct = bs_model(depth)
+                    # Using L1 loss on the rectified direct image as an example
+                    bs_loss = bs_criterion(torch.relu(direct), torch.zeros_like(direct))
+                scaler.scale(bs_loss).backward()
+                scaler.step(bs_optimizer)
+                scaler.update()
+                total_bs_time += (time() - start)
+                total_bs_evals += batch_size
         
-        direct_mean = direct.mean(dim=[2, 3], keepdim=True)
-        direct_std = direct.std(dim=[2, 3], keepdim=True)
+        direct_mean = direct.mean(dim=1, keepdim=True)
+        direct_std = direct.std(dim=1, keepdim=True)
         direct_z = (direct - direct_mean) / direct_std
         clamped_z = torch.clamp(direct_z, -5, 5)
         threshold = torch.Tensor([1./255]).to(device)
-        direct_no_grad = torch.clamp((clamped_z * direct_std) +
-                                     torch.maximum(direct_mean, threshold), 0, 1).detach()
+        direct_no_grad = torch.clamp((clamped_z * direct_std) + torch.maximum(direct_mean, threshold), 0, 1).detach()
 
         for _ in trange(args.init_iters if j == 0 else args.iters, desc="Deattenuate Iterations"):
             start = time()

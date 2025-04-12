@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
-from torchvision.models import models
+import torchvision.models as models
 import kornia.morphology as morph
 from PIL import Image
 try:
@@ -58,6 +58,15 @@ class BackscatterNet(nn.Module):
     def __init__(self):
         super().__init__()
         mobilenet = models.mobilenet_v2(pretrained=False).features
+        first_conv = mobilenet[0][0]
+        mobilenet[0][0] = nn.Conv2d(
+            in_channels=1,       
+            out_channels=first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            bias=False
+        )
         self.features = mobilenet
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         # MobileNetV2 outputs 1280 channels by default
@@ -101,7 +110,7 @@ class BackscatterLoss(nn.Module):
         self.l1 = nn.L1Loss()
         self.smooth_l1 = nn.SmoothL1Loss(beta=0.2)
 
-    def forward(self, direct):
+    def forward(self, image_batch, depth):
         # Assume direct is normalized in [0, 1]. Quantize to get table indices.
         indices = (direct * (self.table.numel() - 1)).long().clamp(0, self.table.numel() - 1)
         # For a differentiable lookup, you might implement linear interpolation.
