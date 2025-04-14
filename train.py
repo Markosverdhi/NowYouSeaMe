@@ -1,6 +1,9 @@
 import logging 
 from datetime import datetime
+import os
 # Logging config stuff
+logs_folder = os.path.join(os.getcwd(), "logs")
+os.makedires(logs_folder, exist_ok=True)
 log_filename = f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
     filename=log_filename,
@@ -17,7 +20,6 @@ logging.getLogger().addHandler(console)
 logging.info("Training started")
 
 
-import os
 import argparse
 import torch
 import torch.nn as nn
@@ -26,6 +28,7 @@ from torchvision.utils import save_image
 from time import time
 from NowYouSeaMe import paired_rgb_depth_dataset, BackscatterNet, DeattenuateNet
 from tqdm import trange
+import torch.nn.functional as F
 
 def main(args):
     # Set seed and device
@@ -38,8 +41,7 @@ def main(args):
     
     # Create dataset and dataloader
     train_dataset = paired_rgb_depth_dataset(
-        args.images, args.depth, args.depth_16u, args.mask_max_depth,
-        args.height, args.width, device
+        args.images, args.depth, args.depth_16u, args.mask_max_depth, device
     )
     os.makedirs(args.output, exist_ok=True)
     dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -66,11 +68,11 @@ def main(args):
 
     for j, (left, depth, fnames) in enumerate(dataloader):
         print(f"Training batch {j}")
-        logging.info("Starting training on batch %d with %d samples", j, batch_size)
         logging.debug("Processing files: %s", fnames)
         image_batch = left  # shape: (B, C, H, W)
         batch_size = image_batch.shape[0]
-        logging.info("Batch size: %d", image_batch.shape[0])
+        logging.info("Batch size: %d", batch_size)
+        
         if j==0:
             for _ in trange(args.init_iters, desc="Backscatter Iterations"):
                 start = time()
@@ -78,13 +80,20 @@ def main(args):
                     direct = bs_model(depth)
                     # Using L1 loss on the rectified direct image as an example
                     bs_loss = bs_criterion(torch.relu(direct), torch.zeros_like(direct))
-                scaler.scale(bs_loss).backward()
-                scaler.step(bs_optimizer)
-                scaler.update()
+                # scaler.scale(bs_loss).backward() #Uncomment for use with AMP
+                # scaler.step(bs_optimizer)
+                # scaler.update()
+                bs_loss.backward() #Uncomment for use without AMP
+                bs_optimizer.step() #""
+                bs_optimizer.zero_grad() #""
                 iter_time = (time() - start)
                 total_bs_time += iter_time
                 total_bs_evals += batch_size
-                logging.info("Iteration %d: Loss = %f, Iteration Time = %f sec", i, bs_loss.item(), iter_time)
+                logging.info("Iteration %d: Loss = %f, Iteration Time = %f sec", j, bs_loss.item(), iter_time)
+
+                if bs_loss.item() == 0:
+                    logging.info("Loss reached zero. skipping the rest of training.")
+                    break
         else:
             for _ in trange(args.iters, desc="Backscatter Iterations"):
                 start = time()
@@ -92,13 +101,20 @@ def main(args):
                     direct = bs_model(depth)
                     # Using L1 loss on the rectified direct image as an example
                     bs_loss = bs_criterion(torch.relu(direct), torch.zeros_like(direct))
-                scaler.scale(bs_loss).backward()
-                scaler.step(bs_optimizer)
-                scaler.update()
+                # scaler.scale(bs_loss).backward() #Uncomment for use with AMP
+                # scaler.step(bs_optimizer)
+                # scaler.update()
+                bs_loss.backward() #Uncomment for use without AMP
+                bs_optimizer.step() #""
+                bs_optimizer.zero_grad() #""
                 iter_time = (time() - start)
                 total_bs_time += iter_time
                 total_bs_evals += batch_size
-                logging.info("Iteration %d: Loss = %f, Iteration Time = %f sec", i, bs_loss.item(), iter_time)
+                logging.info("Iteration %d: Loss = %f, Iteration Time = %f sec", j, bs_loss.item(), iter_time)
+
+                if bs_loss.item() == 0:
+                    logging.info("Loss reached zero. skipping the rest of training.")
+                    break
         
         direct_mean = direct.mean(dim=1, keepdim=True)
         direct_std = direct.std(dim=1, keepdim=True)
@@ -106,20 +122,58 @@ def main(args):
         clamped_z = torch.clamp(direct_z, -5, 5)
         threshold = torch.Tensor([1./255]).to(device)
         direct_no_grad = torch.clamp((clamped_z * direct_std) + torch.maximum(direct_mean, threshold), 0, 1).detach()
-        logging.info("Statistics from last batch: direct_mean = %s, direct_std = %s", direct_mean.cpu().numpy(), direct_std.cpu().numpy())
+        logging.info("Statistics from last batch: direct_mean = %s, direct_std = %s", direct_mean.detach().cpu().numpy(), direct_std.detach().cpu().numpy())
         logging.info("Transitioning to deattenuation stage.")
-        
-        for _ in trange(args.init_iters if j == 0 else args.iters, desc="Deattenuate Iterations"):
-            start = time()
-            with torch.cuda.amp.autocast():
-                f, J = da_model(direct_no_grad, depth)
-                da_loss = da_criterion(direct_no_grad, J)
-            scaler.scale(da_loss).backward()
-            scaler.step(da_optimizer)
-            scaler.update()
-            total_da_time += (time() - start)
-            total_da_evals += batch_size
 
+        if j == 0:
+            for i in trange(args.init_iters, desc="Deattenuate Iterations"):
+                start = time()
+                with torch.cuda.amp.autocast():
+                    # Forward pass: produce the spatial attenuation map.
+                    J = da_model(direct_no_grad, depth)
+                    # Aggregate the global signal from the direct output:
+                    # direct_no_grad: (B, 3)  --> average over channels --> (B, 1)
+                    direct_global = direct_no_grad.mean(dim=1, keepdim=True)
+                    # Aggregate the spatial map J: (B, 1, H, W) --> pool to (B, 1, 1, 1)
+                    J_global = F.adaptive_avg_pool2d(J, (1, 1)).view(J.size(0), -1)
+                    # Compute the loss (e.g., MSELoss) between these global descriptors.
+                    da_loss = da_criterion(direct_global, J_global)
+                # For AMP, you would use scaler.scale(da_loss).backward(), etc.
+                # Here, we use standard backward:
+                da_loss.backward()
+                da_optimizer.step()
+                da_optimizer.zero_grad()
+                iter_time = time() - start
+                total_da_time += iter_time
+                total_da_evals += batch_size
+                logging.info("Iteration %d (Batch %d): Loss = %f, Iteration Time = %f sec", i, j, da_loss.item(), iter_time)
+                
+                if da_loss.item() == 0:
+                    logging.info("Loss reached zero. Skipping the rest of training in this batch.")
+                    break
+            else:
+                for i in trange(args.iters, desc="Deattenuate Iterations"):
+                    start = time()
+                    with torch.cuda.amp.autocast():
+                        J = da_model(direct_no_grad, depth)
+                        direct_global = direct_no_grad.mean(dim=1, keepdim=True)
+                        J_global = F.adaptive_avg_pool2d(J, (1, 1)).view(J.size(0), -1)
+                        da_loss = da_criterion(direct_global, J_global)
+                    # For AMP, uncomment these lines instead:
+                    # scaler.scale(da_loss).backward()
+                    # scaler.step(da_optimizer)
+                    # scaler.update()
+                    da_loss.backward()
+                    da_optimizer.step()
+                    da_optimizer.zero_grad()
+                    iter_time = time() - start
+                    total_da_time += iter_time
+                    total_da_evals += batch_size
+                    logging.info("Iteration %d (Batch %d): Loss = %f, Iteration Time = %f sec", i, j, da_loss.item(), iter_time)
+                
+                if da_loss.item() == 0:
+                    logging.info("Loss reached zero. Skipping the rest of training in this batch.")
+                    break
         # Offload loss metrics to CPU for logging
         bs_loss_cpu = bs_loss.detach().cpu().item()
         da_loss_cpu = da_loss.detach().cpu().item()
@@ -132,32 +186,36 @@ def main(args):
         
         # Save intermediate outputs if desired (moved to CPU)
         direct_img = torch.clamp(direct_no_grad, 0, 1).cpu()
-        backscatter_img = torch.clamp(backscatter, 0, 1).cpu()
-        f_img = f.cpu()
-        f_img = f_img / f_img.max()  # Normalize for saving
+        # Remove or comment out the backscatter line if not needed:
+        # backscatter_img = torch.clamp(backscatter, 0, 1).cpu()
         J_img = torch.clamp(J, 0, 1).cpu()
-        
+
         for side in range(1):  # assuming single side here
             names = fnames[side]
             for n in range(batch_size):
                 name = names[n].rstrip('.png')
                 if args.save_intermediates:
                     save_image(direct_img[n], os.path.join(args.output, f"{name}-direct.png"))
-                    save_image(backscatter_img[n], os.path.join(args.output, f"{name}-backscatter.png"))
+                    # Remove this save if not needed:
+                    # save_image(backscatter_img[n], os.path.join(args.output, f"{name}-backscatter.png"))
                     save_image(f_img[n], os.path.join(args.output, f"{name}-f.png"))
                 save_image(J_img[n], os.path.join(args.output, f"{name}-corrected.png"))
 
     if args.save is not None:
-        bs_model_cpu = bs_model.cpu().state_dict() #offload saving to CPUs
-        da_model_cpu = da_model.cpu().state_dict()
+        # Move models to CPU and retrieve their state dictionaries.
+        bs_model_cpu_state = bs_model.cpu().state_dict()
+        da_model_cpu_state = da_model.cpu().state_dict()
+        
+        # Define the checkpoint save path.
         save_path = os.path.join(args.output, f"{args.save}.pth")
+        
+        # Save only the model state dictionaries and the args (for reproducibility).
         torch.save({
-            'backscatter_model_state': bs_model_cpu,
-            'deattenuate_model_state': da_model_cpu,
-            'backscatter_optimizer_state': bs_optimizer.state_dict(),
-            'deattenuate_optimizer_state': da_optimizer.state_dict(),
+            'backscatter_model_state_dict': bs_model_cpu_state,
+            'deattenuate_model_state_dict': da_model_cpu_state,
             'args': vars(args)
         }, save_path)
+        
         print(f"Models saved to {save_path}")
 
 if __name__ == '__main__':

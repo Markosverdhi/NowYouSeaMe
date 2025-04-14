@@ -15,8 +15,12 @@
                 
                 "--images", "C:/Users/Markos Verdhi/Desktop/D3/D3_dist/D3/linearPNG",
                 "--depth", "C:/Users/Markos Verdhi/Desktop/D3/D3_dist/D3/depth",
-                "--output", "/output",
-                "--save", "1.0"
+                "--output", "C:/Users/Markos Verdhi/Desktop/output",
+                "--save", "1.0",
+                "--batch_size", "1",
+                "--init_lr","1e-3",
+                "--init_iter","10",
+                "--iter","1"
             ]
         }
     ]

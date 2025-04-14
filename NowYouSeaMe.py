@@ -5,6 +5,7 @@ import torch
 from time import time
 from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 import torchvision.models as models
@@ -16,7 +17,7 @@ except:
     trange = range
 
 class paired_rgb_depth_dataset(Dataset):
-    def __init__(self, image_path, depth_path, openni_depth, mask_max_depth, image_height, image_width, device):
+    def __init__(self, image_path, depth_path, openni_depth, mask_max_depth, device):
         self.image_dir = image_path
         self.depth_dir = depth_path
         self.image_files = sorted(os.listdir(image_path))
@@ -24,34 +25,40 @@ class paired_rgb_depth_dataset(Dataset):
         self.device = device
         self.openni_depth = openni_depth
         self.mask_max_depth = mask_max_depth
-        self.crop = (0, 0, image_height, image_width)
-        self.depth_perc = 0.0001
-        self.kernel = torch.ones(3, 3).to(device=device)
-        self.image_transforms = transforms.Compose([
-            transforms.Resize((self.crop[2], self.crop[3]), transforms.InterpolationMode.BILINEAR, antialias=True),
-            transforms.PILToTensor(),
+
+        # Set up a transform to resize images to 720p (height=720, width=1280)
+        self.transform = transforms.Compose([
+            transforms.Resize((720, 1280), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+            transforms.PILToTensor(),  # Converts a PIL Image to a tensor (values in [0,255])
         ])
-        assert len(self.image_files) == len(self.depth_files)
 
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, index):
-        fname = self.image_files[index]
-        image = Image.open(os.path.join(self.image_dir, fname))
-        depth_fname = self.depth_files[index]
-        depth = Image.open(os.path.join(self.depth_dir, depth_fname))
-        depth_transformed: torch.Tensor = self.image_transforms(depth).float().to(device=self.device)
+        # Load the RGB image and depth map
+        image_path = os.path.join(self.image_dir, self.image_files[index])
+        depth_path = os.path.join(self.depth_dir, self.depth_files[index])
+        image = Image.open(image_path).convert('RGB')
+        depth = Image.open(depth_path)
+
+        # Apply the transform to both the image and depth map.
+        # You might want a different transform for depth (e.g., if it's single-channel),
+        # but here's an example using the same resize.
+        image_tensor = self.transform(image).float().to(self.device) / 255.0  # Normalize image to [0, 1]
+        depth_tensor = self.transform(depth).float().to(self.device)
+
         if self.openni_depth:
-            depth_transformed = depth_transformed / 1000.
+            # Example conversion if depth values are in millimeters (16-bit) and need conversion to meters.
+            depth_tensor = depth_tensor / 1000.0
+
         if self.mask_max_depth:
-            depth_transformed[depth_transformed == 0.] = depth_transformed.max()
-        low, high = torch.nanquantile(depth_transformed, self.depth_perc), torch.nanquantile(depth_transformed,
-                                                                                             1. - self.depth_perc)
-        depth_transformed[(depth_transformed < low) | (depth_transformed > high)] = 0.
-        depth_transformed = torch.squeeze(morph.closing(torch.unsqueeze(depth_transformed, dim=0), self.kernel), dim=0)
-        left_transformed: torch.Tensor = self.image_transforms(image).to(device=self.device) / 255.
-        return left_transformed, depth_transformed, [fname]
+            depth_tensor[depth_tensor == 0.] = depth_tensor.max()
+
+        # Optionally, you could add further processing to the depth tensor,
+        # like quantile-based clipping or morphological operations if needed.
+
+        return image_tensor, depth_tensor, self.image_files[index]
 
 
 class BackscatterNet(nn.Module):
@@ -82,23 +89,76 @@ class BackscatterNet(nn.Module):
         return self.sigmoid(out)
 
 class DeattenuateNet(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=4):
+        """
+        Constructs a deattenuation network that produces a full-resolution (spatial) 
+        attenuation map.
+
+        Args:
+            in_channels (int): Number of input channels after concatenating the direct 
+                               output (from BackscatterNet) and the depth map.
+                               For example, if direct is a 3-channel image (expanded) 
+                               and depth is 1 channel, then in_channels should be 4.
+        """
         super().__init__()
+        # Load MobileNetV2 features
         mobilenet = models.mobilenet_v2(pretrained=False).features
+        # Adjust the first convolution to accept `in_channels` instead of the default 3.
+        first_conv = mobilenet[0][0]
+        mobilenet[0][0] = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            bias=False
+        )
         self.features = mobilenet
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        # This example assumes you combine information from the direct image and depth
-        self.fc = nn.Linear(1280, 1)  # Predict a single attenuation factor
-        self.output_act = nn.Sigmoid()
+        
+        # Instead of global pooling + fully-connected layer, build a deconvolutional head
+        # that maintains spatial information. This head converts the backbones' 
+        # lower-resolution feature map into a full-resolution per-pixel attenuation map.
+        self.deconv = nn.Sequential(
+            nn.Conv2d(1280, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()  # Constrains the output to [0, 1]
+        )
 
     def forward(self, direct, depth):
-        # Example: concatenate along the channel dimension (you might need a 1x1 conv to adjust channels)
+        """
+        Forward pass of the deattenuation network.
+
+        Args:
+            direct: A tensor from BackscatterNet. If direct is 2D (B, C) as a global 
+                    descriptor, it will be expanded to (B, C, H, W) using the spatial 
+                    dimensions of the depth tensor.
+            depth:  The depth map tensor of shape (B, 1, H, W).
+
+        Returns:
+            attenuation_map: A per-pixel attenuation map of shape (B, 1, H, W)
+        """
+        # If direct is a global descriptor (e.g. shape: (B, C)), expand it to 4D.
+        if direct.dim() == 2:
+            B = direct.shape[0]
+            H, W = depth.shape[2], depth.shape[3]
+            direct = direct.unsqueeze(-1).unsqueeze(-1).expand(B, direct.shape[1], H, W)
+        
+        # Concatenate the expanded direct output and the depth map along the channel dimension.
+        # For instance, if direct has shape (B, 3, H, W) and depth is (B, 1, H, W),
+        # then x will have shape (B, 4, H, W).
         x = torch.cat([direct, depth], dim=1)
+        
+        # Process the combined input with MobileNetV2 features. Note that MobileNetV2 will
+        # reduce the spatial resolution (typically by a factor ~32).
         x = self.features(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        out = self.fc(x)
-        return self.output_act(out)
+        
+        # Upsample the feature map back to the original spatial size of the depth map.
+        x = F.interpolate(x, size=depth.shape[2:], mode='bilinear', align_corners=False)
+        
+        # Use the deconvolutional head to produce a per-pixel attenuation map.
+        attenuation_map = self.deconv(x)
+        return attenuation_map
 
 
 class BackscatterLoss(nn.Module):
@@ -130,12 +190,23 @@ class DeattenuationLoss(nn.Module):
         self.mse = nn.MSELoss()
 
     def forward(self, direct, J):
-        # Quantize J (assumed normalized) to index into the lookup table.
+        # Quantize J to indices and retrieve corresponding lookup table values.
+        # This encourages a smooth, discretized mapping.
         indices = (J * (self.table.numel() - 1)).long().clamp(0, self.table.numel() - 1)
-        table_values = self.table[indices]
-        lookup_loss = ((J - table_values)**2).mean()
-        saturation_loss = ((torch.relu(-J) + torch.relu(J - 1))**2).mean()
+        table_values = self.table[indices]  # Same shape as J.
+        lookup_loss = ((J - table_values) ** 2).mean()
+
+        # Saturation loss penalizes values that exceed the expected [0, 1] range.
+        saturation_loss = ((F.relu(-J) + F.relu(J - 1)) ** 2).mean()
+
+        # Intensity loss: ensure the average intensity per channel is close to a desired target.
         channel_intensities = J.mean(dim=[2, 3], keepdim=True)
-        intensity_loss = ((channel_intensities - self.target_intensity)**2).mean()
+        intensity_loss = ((channel_intensities - self.target_intensity) ** 2).mean()
+
+        # Spatial variation loss: if direct is the expanded backscatter correction, its
+        # spatial standard deviation (if any) is compared with that of J.
+        # Note: if direct was originally global and then expanded, it might show low variation.
         spatial_variation_loss = self.mse(J.std(dim=[2, 3]), direct.std(dim=[2, 3]))
-        return saturation_loss + intensity_loss + spatial_variation_loss + lookup_loss
+
+        total_loss = lookup_loss + saturation_loss + intensity_loss + spatial_variation_loss
+        return total_loss
