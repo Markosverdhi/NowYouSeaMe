@@ -17,7 +17,8 @@ except:
     trange = range
 
 class paired_rgb_depth_dataset(Dataset):
-    def __init__(self, image_path, depth_path, openni_depth, mask_max_depth, device):
+    def __init__(self, image_path, depth_path, openni_depth, mask_max_depth, device,
+                 patch_height=400, overlap=40):
         self.image_dir = image_path
         self.depth_dir = depth_path
         self.image_files = sorted(os.listdir(image_path))
@@ -25,40 +26,57 @@ class paired_rgb_depth_dataset(Dataset):
         self.device = device
         self.openni_depth = openni_depth
         self.mask_max_depth = mask_max_depth
+        self.patch_height = patch_height
+        self.overlap = overlap
 
-        # Set up a transform to resize images to 720p (height=720, width=1280)
-        self.transform = transforms.Compose([
-            transforms.Resize((720, 1280), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
-            transforms.PILToTensor(),  # Converts a PIL Image to a tensor (values in [0,255])
+        self.to_tensor = transforms.Compose([
+            transforms.PILToTensor(),  # keep full resolution
         ])
 
     def __len__(self):
         return len(self.image_files)
 
+    def _split_vertical_patches(self, tensor):
+        _, H, W = tensor.shape
+        step = self.patch_height - self.overlap
+        starts = list(range(0, H - self.patch_height + 1, step))
+
+        patches = []
+        for start in starts:
+            end = start + self.patch_height
+            patches.append((tensor[:, start:end, :], start, end))
+        
+        # Handle bottom edge if it doesn’t align perfectly
+        if patches[-1][2] < H:
+            patch = tensor[:, -self.patch_height:, :]
+            patches.append((patch, H - self.patch_height, H))
+        
+        return patches
+
     def __getitem__(self, index):
-        # Load the RGB image and depth map
         image_path = os.path.join(self.image_dir, self.image_files[index])
         depth_path = os.path.join(self.depth_dir, self.depth_files[index])
         image = Image.open(image_path).convert('RGB')
         depth = Image.open(depth_path)
 
-        # Apply the transform to both the image and depth map.
-        # You might want a different transform for depth (e.g., if it's single-channel),
-        # but here's an example using the same resize.
-        image_tensor = self.transform(image).float().to(self.device) / 255.0  # Normalize image to [0, 1]
-        depth_tensor = self.transform(depth).float().to(self.device)
+        image_tensor = self.to_tensor(image).float().to(self.device) / 255.0
+        depth_tensor = self.to_tensor(depth).float().to(self.device)
 
         if self.openni_depth:
-            # Example conversion if depth values are in millimeters (16-bit) and need conversion to meters.
             depth_tensor = depth_tensor / 1000.0
 
         if self.mask_max_depth:
             depth_tensor[depth_tensor == 0.] = depth_tensor.max()
 
-        # Optionally, you could add further processing to the depth tensor,
-        # like quantile-based clipping or morphological operations if needed.
+        image_patches = self._split_vertical_patches(image_tensor)
+        depth_patches = self._split_vertical_patches(depth_tensor)
 
-        return image_tensor, depth_tensor, self.image_files[index]
+        patch_list = []
+        for i, ((img_patch, start, end), (d_patch, _, _)) in enumerate(zip(image_patches, depth_patches)):
+            patch_list.append((img_patch, d_patch, self.image_files[index], i, start, end))
+
+        return patch_list
+
 
 
 class BackscatterNet(nn.Module):
