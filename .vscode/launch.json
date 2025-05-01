@@ -4,24 +4,14 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
-        {
-            "name": "Python Debugger: Current File",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-            "args": [
-                
-                "--images", "C:/Users/Markos Verdhi/Desktop/D3/D3_dist/D3/linearPNG",
-                "--depth", "C:/Users/Markos Verdhi/Desktop/D3/D3_dist/D3/depth",
-                "--output", "C:/Users/Markos Verdhi/Desktop/output",
-                "--save", "1.0",
-                "--batch_size", "1",
-                "--init_lr","1e-3",
-                "--init_iter","10",
-                "--iter","1"
-            ]
-        }
+        "--images":"C:/Users/Markos Verdhi/Documents/CMPSCprojects/DS430W/NowYouSeaMe/testPhotos",
+        "--depth":"C:/Users/Markos Verdhi/Documents/CMPSCprojects/DS430W/NowYouSeaMe/depthMaps",
+        "--ouput":"C:/Users/Markos Verdhi/Documents/CMPSCprojects/DS430W/NowYouSeaMe/checkpoints",
+        "--init_lr":"",
+        "--init_iters":"1",
+        "--iters":"1",
+        "--batch_size":"1",
+        "--save":"1.1",
+        "--device":"cpu"
     ]
 }

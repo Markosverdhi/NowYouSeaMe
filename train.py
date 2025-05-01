@@ -33,21 +33,39 @@ import torch.nn.functional as F
 def stitch_patches(patch_outputs, full_height, width):
     """
     Stitch overlapping vertical patches by averaging overlaps.
+    
     Args:
         patch_outputs: List of (patch_tensor[C, H, W], start, end)
         full_height: int, full image height
         width: int, full image width
+    
     Returns:
         Tensor[C, full_height, width]
     """
-    result = torch.zeros((3, full_height, width))
-    count  = torch.zeros((1, full_height, width))
+    device = patch_outputs[0][0].device
+
+    result = torch.zeros((3, full_height, width), device=device)
+    count  = torch.zeros((3, full_height, width), device=device)
 
     for patch, start, end in patch_outputs:
+        patch_height = patch.shape[1]
+        expected_height = end - start
+
+        if patch_height != expected_height:
+            patch = patch[:, :expected_height, :]
+
         result[:, start:end, :] += patch
         count[:, start:end, :]  += 1
-
+    count[count == 0] = 1
     return result / count
+
+def collate_fn(batch):
+    images, depths, filenames = zip(*batch)
+
+    # Stack tensors normally
+    image_batch = torch.stack(images)
+    depth_batch = torch.stack(depths)
+    return image_batch, depth_batch, list(filenames)
 
 def main(args):
     seed = int(torch.randint(9223372036854775807, (1,))[0]) if args.seed is None else args.seed
@@ -56,113 +74,107 @@ def main(args):
     torch.manual_seed(seed)
     torch.autograd.set_detect_anomaly(True)
     device = torch.device(args.device)
-    
+
     train_dataset = paired_rgb_depth_dataset(
         args.images, args.depth, args.depth_16u, args.mask_max_depth, device
     )
     os.makedirs(args.output, exist_ok=True)
-    dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: x[0])
-    logging.info("Training Dataset contains %d batches", len(dataloader))
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn = collate_fn
+    )
+    logging.info("Training Dataset contains %d images", len(dataloader))
 
     bs_model = BackscatterNet().to(device)
     da_model = DeattenuateNet().to(device)
-    bs_criterion = nn.L1Loss().to(device) 
+    bs_criterion = nn.L1Loss().to(device)
     da_criterion = nn.MSELoss().to(device)
     bs_optimizer = torch.optim.Adam(bs_model.parameters(), lr=args.init_lr)
     da_optimizer = torch.optim.Adam(da_model.parameters(), lr=args.init_lr)
-    
+
     logging.info("Initializing BackscatterNet with architecture details: %s", bs_model)
     logging.info("Initializing DeattenuateNet with architecture details: %s", da_model)
     logging.info("Using Adam optimizer with learning rate %f", args.init_lr)
 
-    scaler = torch.cuda.amp.GradScaler()
-    
+    scaler = torch.amp.GradScaler("cuda")
+
     total_bs_time = 0.0
     total_bs_evals = 0
     total_da_time = 0.0
     total_da_evals = 0
 
-    for j, patch_list in enumerate(dataloader):
-        logging.info("Processing image %d/%d: %s", j+1, len(dataloader), patch_list[0][2])
-        patch_outputs_direct = []
-        patch_outputs_J      = []
+    for j, (rgb, depth, fname_list) in enumerate(dataloader):
+        for i in range(rgb.size(0)):
+            logging.info("Processing image %d/%d: %s", j + 1, len(dataloader), fname_list)
 
-        # Training loop per patch
-        for img_patch, depth_patch, fname, patch_idx, start, end in patch_list:
-            rgb   = img_patch.unsqueeze(0).to(device)
-            depth = depth_patch.unsqueeze(0).to(device)
+            rgb = rgb.to(device)
+            depth = depth.to(device)
+            depth = F.interpolate(depth, size=(args.height, args.width), mode='bilinear', align_corners=False)
+            fname = fname_list[i]
 
-            # Backscatter training on this patch
             bs_iters = args.init_iters if j == 0 else args.iters
             for _ in trange(bs_iters, desc="Backscatter Iter"):
                 t0 = time()
-                with torch.cuda.amp.autocast():
-                    direct   = bs_model(depth)
-                    bs_loss  = bs_criterion(torch.relu(direct), torch.zeros_like(direct))
+                with torch.amp.autocast('cuda'):
+                    direct = bs_model(depth)
+                    bs_loss = bs_criterion(direct, torch.zeros_like(direct))
                 bs_loss.backward()
                 bs_optimizer.step()
                 bs_optimizer.zero_grad()
-                total_bs_time  += (time() - t0)
+                total_bs_time += (time() - t0)
                 total_bs_evals += 1
                 if bs_loss.item() == 0:
                     break
 
-            # normalize + clamp for next stage
-            eps = 1e-5
-            direct_mean = direct.mean(dim=1, keepdim=True)
-            direct_std  = direct.std(dim=1, keepdim=True, unbiased=False).clamp(min=eps)
-            direct_z     = (direct - direct_mean) / direct_std
-            clamped_z   = torch.clamp(direct_z, -5, 5)
-            thr         = torch.tensor([1.0/255]).to(device)
-            direct_no_grad = torch.clamp(clamped_z * direct_std + torch.maximum(direct_mean, thr), 0, 1).detach()
+            direct_no_grad = torch.clamp(direct.detach(), 0, 1)
 
-            patch_outputs_direct.append((direct_no_grad.squeeze(0).cpu(), start, end))
-
-            # Deattenuation training on this patch
             da_iters = args.init_iters if j == 0 else args.iters
             for _ in trange(da_iters, desc="Deattenuate Iter"):
                 t1 = time()
-                with torch.cuda.amp.autocast():
-                    J           = da_model(direct_no_grad, depth)
-                    direct_glob = direct_no_grad.mean(dim=1, keepdim=True)
-                    J_glob      = F.adaptive_avg_pool2d(J, (1,1)).view(J.size(0), -1)
-                    da_loss     = da_criterion(direct_glob, J_glob)
-                da_loss.backward()
-                da_optimizer.step()
+                with torch.amp.autocast('cuda'):
+                    J = da_model(direct_no_grad, depth)
+                    direct_glob = F.adaptive_avg_pool2d(direct_no_grad, (1, 1)).view(J.size(0), -1)
+                    J_glob = F.adaptive_avg_pool2d(J, (1, 1)).view(J.size(0), -1)
+                    da_loss = da_criterion(direct_glob, J_glob)
+                    J_glob = torch.clamp(J_glob, 0, 1)
+                    direct_glob = torch.clamp(direct_glob, 0, 1)
+
+                    if torch.isnan(direct_glob).any() or torch.isnan(J_glob).any():
+                        logging.warning("NaNs detected in inputs to DA loss")
+                        torch.cuda.empty_cache()
+                        continue
+
+                if torch.isnan(da_loss):
+                    logging.error("NaN detected in da_loss - skipping backward pass")
+                else:
+                    scaler.scale(da_loss).backward()
+
+                torch.nn.utils.clip_grad_norm_(da_model.parameters(), 1.0)
+
+                scaler.step(da_optimizer)
+                scaler.update()
                 da_optimizer.zero_grad()
-                total_da_time  += (time() - t1)
-                total_da_evals += 1
                 if da_loss.item() == 0:
                     break
 
-            patch_outputs_J.append((J.squeeze(0).cpu(), start, end))
-
-        # stitch & save
-        full_direct = stitch_patches(patch_outputs_direct, full_height=args.height, width=args.width)
-        full_J      = stitch_patches(patch_outputs_J,      full_height=args.height, width=args.width)
-
-        base_name = patch_list[0][2].rstrip('.png')
+        base_name = fname.rstrip('.png')
         if args.save_intermediates:
-            save_image(full_direct, os.path.join(args.output, f"{base_name}-direct.png"))
-        save_image(full_J, os.path.join(args.output, f"{base_name}-corrected.png"))
-
+            save_image(direct_no_grad.squeeze(0).cpu(), os.path.join(args.output, f"{base_name}-direct.png"))
+        save_image(J.squeeze(0).cpu(), os.path.join(args.output, f"{base_name}-corrected.png"))
 
     if args.save is not None:
-        # Move models to CPU and retrieve their state dictionaries.
         bs_model_cpu_state = bs_model.cpu().state_dict()
         da_model_cpu_state = da_model.cpu().state_dict()
-        
-        # Define the checkpoint save path.
         save_path = os.path.join(args.output, f"{args.save}.pth")
-        
-        # Save only the model state dictionaries and the args (for reproducibility).
         torch.save({
             'backscatter_model_state_dict': bs_model_cpu_state,
             'deattenuate_model_state_dict': da_model_cpu_state,
             'args': vars(args)
         }, save_path)
-        
         print(f"Models saved to {save_path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

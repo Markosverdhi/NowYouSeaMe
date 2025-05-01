@@ -67,15 +67,15 @@ class paired_rgb_depth_dataset(Dataset):
 
         if self.mask_max_depth:
             depth_tensor[depth_tensor == 0.] = depth_tensor.max()
+        
+        # image_patches = self._split_vertical_patches(image_tensor) #For image splitting, uncomment this
+        # depth_patches = self._split_vertical_patches(depth_tensor)
+        # patch_list = []
+        # for i, ((img_patch, start, end), (d_patch, _, _)) in enumerate(zip(image_patches, depth_patches)):
+        #     patch_list.append((img_patch, d_patch, self.image_files[index], i, start, end))
 
-        image_patches = self._split_vertical_patches(image_tensor)
-        depth_patches = self._split_vertical_patches(depth_tensor)
-
-        patch_list = []
-        for i, ((img_patch, start, end), (d_patch, _, _)) in enumerate(zip(image_patches, depth_patches)):
-            patch_list.append((img_patch, d_patch, self.image_files[index], i, start, end))
-
-        return patch_list
+        # return patch_list
+        return image_tensor, depth_tensor, self.image_files[index]
 
 
 
@@ -85,26 +85,35 @@ class BackscatterNet(nn.Module):
         mobilenet = models.mobilenet_v2(pretrained=False).features
         first_conv = mobilenet[0][0]
         mobilenet[0][0] = nn.Conv2d(
-            in_channels=1,       
+            in_channels=1,
             out_channels=first_conv.out_channels,
             kernel_size=first_conv.kernel_size,
             stride=first_conv.stride,
             padding=first_conv.padding,
             bias=False
         )
-        self.features = mobilenet
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        # MobileNetV2 outputs 1280 channels by default
-        self.fc = nn.Linear(1280, 3)  # Predict 3 correction parameters
-        self.sigmoid = nn.Sigmoid()
+        self.encoder = mobilenet
+
+        # Basic decoder to upscale to original size (adjust layers as needed)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(1280, 256, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 3, kernel_size=3, stride=1, padding=1),             
+            nn.Sigmoid()
+        )
+
 
     def forward(self, depth):
-        # Use depth as input (ensure it has the proper shape)
-        x = self.features(depth)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        out = self.fc(x)
-        return self.sigmoid(out)
+        x = self.encoder(depth)
+        x = self.decoder(x)
+        return x  # Shape: (B, 3, H, W)
+
 
 class DeattenuateNet(nn.Module):
     def __init__(self, in_channels=4):
@@ -156,25 +165,13 @@ class DeattenuateNet(nn.Module):
         Returns:
             attenuation_map: A per-pixel attenuation map of shape (B, 1, H, W)
         """
-        # If direct is a global descriptor (e.g. shape: (B, C)), expand it to 4D.
-        if direct.dim() == 2:
-            B = direct.shape[0]
-            H, W = depth.shape[2], depth.shape[3]
-            direct = direct.unsqueeze(-1).unsqueeze(-1).expand(B, direct.shape[1], H, W)
-        
-        # Concatenate the expanded direct output and the depth map along the channel dimension.
-        # For instance, if direct has shape (B, 3, H, W) and depth is (B, 1, H, W),
-        # then x will have shape (B, 4, H, W).
+        if direct.shape[2:] != depth.shape[2:]:
+            direct = F.interpolate(direct, size=depth.shape[2:], mode='bilinear', align_corners=False)
+
         x = torch.cat([direct, depth], dim=1)
-        
-        # Process the combined input with MobileNetV2 features. Note that MobileNetV2 will
-        # reduce the spatial resolution (typically by a factor ~32).
         x = self.features(x)
-        
-        # Upsample the feature map back to the original spatial size of the depth map.
         x = F.interpolate(x, size=depth.shape[2:], mode='bilinear', align_corners=False)
-        
-        # Use the deconvolutional head to produce a per-pixel attenuation map.
+        x = torch.clamp(x,-10,10)
         attenuation_map = self.deconv(x)
         return attenuation_map
 

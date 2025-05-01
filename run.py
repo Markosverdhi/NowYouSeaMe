@@ -38,9 +38,9 @@ def stitch_patches(patch_outputs, full_height, width):
     return result / count
 
 def load_rgb_depth_pair(rgb_path, depth_path, depth_16u, mask_max_depth, device):
-    to_tensor = T.Compose([ T.PILToTensor() ])
+    to_tensor = T.ToTensor()
     rgb   = Image.open(rgb_path).convert('RGB')
-    depth = Image.open(depth_path)
+    depth = Image.open(depth_path).convert("I")
     rgb_t   = to_tensor(rgb).float().to(device) / 255.0
     depth_t = to_tensor(depth).float().to(device)
     if depth_16u:
@@ -82,12 +82,9 @@ def main(args):
     overlap = args.overlap
 
     with torch.no_grad():
-        # --- Backscatter (global) ---
-        direct_vec = bs_model(depth.unsqueeze(0))     # shape (1,3)
-        direct_full = direct_vec.view(1,3,1,1).expand(1,3,H,W)
+        direct_full = bs_model(depth.unsqueeze(0)) 
         save_image(torch.clamp(direct_full[0],0,1), os.path.join(args.output, "direct.png"))
 
-        # --- Z-score + clamp (full) ---
         eps = 1e-5
         mean_full = direct_full.mean(dim=1, keepdim=True)
         std_full  = direct_full.std(dim=1, keepdim=True).clamp(min=eps)
@@ -115,7 +112,7 @@ def main(args):
         full_J = stitch_patches(J_patches, full_height=H, width=W)
         save_image(torch.clamp(full_J,0,1), os.path.join(args.output, "final_corrected.png"))
 
-        print("✅ Debug outputs saved in", args.output)
+        print("Debug outputs saved in", args.output)
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
